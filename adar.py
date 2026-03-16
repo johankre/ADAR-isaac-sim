@@ -40,7 +40,7 @@ class Adar:
 
     def _sensor_sphere(self, radius=0.1):
         """
-        Creates a visual sphere at the sensor origin.
+        Creates a visual sphere at the sensor origin representing the sensor.
         """
 
         prim = self._stage.GetPrimAtPath(self._sensor_path)
@@ -88,7 +88,7 @@ class Adar:
         n /= n_norm 
         dot = float(np.dot(d, n))
 
-        return abs(dot) > (1 - threshold)
+        return abs(dot) < threshold
 
     def _scan(self):
         hits = []
@@ -101,7 +101,7 @@ class Adar:
 
 
             n = hit["normal"]
-            if self._is_orthogonal_to_normal(dir, n, self.ortho_tol):
+            if self._is_parallel_to_normal(dir, n, self.ortho_tol):
                 p = hit["position"]
                 hits.append((float(p[0]), float(p[1]), float(p[2])))
                 hits_normals.append((float(n[0]), float(n[1]), float(n[2])))
@@ -433,6 +433,9 @@ def update(dt: float):
             probe_points = [hit["position"] for hit in probe_hits]
             probe_normals = [hit["normal"] for hit in probe_hits]
             adar._draw_probe_points(probe_points)
+            if adar.is_surface_planar(hit, hit_normal, probe_points, probe_normals, curvature_threshold=0.02):
+                points.append(hit)
+                continue
             
             # include the center point and normal of interest as well
             probe_points.append(hit)
@@ -441,6 +444,7 @@ def update(dt: float):
 
             f, grad_f, hess_f = adar.surface_interpolation(probe_points, probe_normals)
             print(f"Hessian at hit {hit}: {hess_f(hit[0], hit[1], hit[2])}")
+            # TODO: Evaluate curvature at the point of interest to determine if hit refelcts enough signal to become a point in the point cloud.
 
             points.append(hit)
 
