@@ -210,6 +210,12 @@ class Adar:
         if hit['hit']:
             return True
         return False
+    
+    def floor_filter(self, point, floor_height=0.01):
+        """
+        Returns True if the point is above the floor height.
+        """
+        return point[2] > floor_height
 
     def _axes_from_direction(self, dir):
         """
@@ -446,6 +452,9 @@ def update(dt: float):
 
     hits, hit_normals = adar._scan()
     for (hit, hit_normal) in zip(hits, hit_normals):
+        if not adar.floor_filter(hit, floor_height=0.01):
+            continue
+
         probe_rays = adar.build_3x3_probe(hit)
         probe_hits = []
 
