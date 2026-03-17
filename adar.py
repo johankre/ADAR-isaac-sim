@@ -21,10 +21,11 @@ _OPPOSING_PAIRS = [
 ]
 
 class Adar:
-    def __init__(self, origin=(0.0, 0.0, 1.0), max_range=5.0, num_points=5000):
+    def __init__(self, origin=(0.0, 0.0, 1.0), max_range=5.0, num_points=5000, wave_length=0.1):
         self.origin = carb.Float3(*map(float, origin))
         self.max_range = max_range
         self.num_points = num_points
+        self.wave_length = wave_length
         self.ortho_tol = 0.02 # cosine of angle threshold for orthogonality (eg. 0.02 ~ 88.85 degrees)
 
         self._stage = omni.usd.get_context().get_stage()
@@ -156,7 +157,7 @@ class Adar:
         dot = float(np.dot(n1, n2))
         return abs(dot) > (1 - threshold)
 
-    def build_3x3_probe(self, point_of_interest, probe_spacing: float = 0.01):
+    def build_3x3_probe(self, point_of_interest):
         """
         Builds a 3x3 grid of probe points around the given point of interest.
         The offset plane is perpendicular to the ray direction at the point of interest, so all probe rays are parallel 
@@ -171,6 +172,7 @@ class Adar:
         axis1, axis2 = self._axes_from_direction(ray_dir)
 
         probe_rays = []
+        probe_spacing = self.wave_length / 2
         for i in range(-1, 2):
             for j in range(-1, 2):
                 if i == 0 and j == 0:
@@ -340,7 +342,6 @@ class Adar:
     
     def evaluate_surface_curvature(self, grad_f, hess_f, center_point):
         """
-        Note: there are many ways to try to estimate the curvature of an implicit surface (need input)
         This implementation evaluates just the curvature at the point of interest on the estimated surface.
 
         We base the curvature estimation on Goldman 2005 "Curvature formulas for implicit curves and surfaces":
@@ -361,6 +362,12 @@ class Adar:
         For H we can have a planar point with H = 0, but also a saddle point with H = 0.
         """
         pass
+
+    def reflection_intensity(self, points, wave_length):
+        k = 4 * np.pi / wave_length
+        F = np.sum(np.exp(1j * k * 2 * (np.asarray(points) - np.asarray(self.origin))))
+        intensity = abs(F)**2
+        return intensity
         
 
     def _draw_probe_points(self, probe_points):
@@ -375,9 +382,9 @@ class Adar:
             return
         
         # draw all hits as red points
-        pts = [carb.Float3(x, y, z) for (x, y, z) in points]
-        colors = [carb.ColorRgba(1.0, 0.0, 0.0, 1.0) for _ in points]
-        sizes  = [10.0 for _ in points]
+        pts = [carb.Float3(x, y, z) for (x, y, z), _ in points]
+        colors = [carb.ColorRgba(1.0, 0.0, 0.0, 1.0) for _, _ in points]
+        sizes  = [intensity * 0.05 for _, intensity in points]
 
         points.extend(pts)
         colors.extend(colors)
@@ -418,7 +425,7 @@ def update(dt: float):
 
     hits, hit_normals = adar._scan()
     for (hit, hit_normal) in zip(hits, hit_normals):
-        probe_rays = adar.build_3x3_probe(hit, 0.03)
+        probe_rays = adar.build_3x3_probe(hit)
         probe_hits = []
 
         for probe_origin, probe_target in probe_rays:
@@ -432,21 +439,11 @@ def update(dt: float):
         else:
             probe_points = [hit["position"] for hit in probe_hits]
             probe_normals = [hit["normal"] for hit in probe_hits]
-            adar._draw_probe_points(probe_points)
-            if adar.is_surface_planar(hit, hit_normal, probe_points, probe_normals, curvature_threshold=0.02):
-                points.append(hit)
-                continue
-            
-            # include the center point and normal of interest as well
             probe_points.append(hit)
             probe_normals.append(hit_normal)
 
-
-            f, grad_f, hess_f = adar.surface_interpolation(probe_points, probe_normals)
-            print(f"Hessian at hit {hit}: {hess_f(hit[0], hit[1], hit[2])}")
-            # TODO: Evaluate curvature at the point of interest to determine if hit refelcts enough signal to become a point in the point cloud.
-
-            points.append(hit)
+            intensity = adar.reflection_intensity(probe_points, adar.wave_length)
+            points.append((hit, intensity))
 
     adar._draw_points(points)
 
