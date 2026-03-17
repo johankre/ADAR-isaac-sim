@@ -30,7 +30,10 @@ class Adar:
 
         self._stage = omni.usd.get_context().get_stage()
         self._sensor_path = "/World/AdarSensor"
+        self._camera_path = self._sensor_path + "/Camera"
+
         self._sensor_sphere(radius=0.1)
+        self._create_camera()
 
         # filterd hits that represent the ADAR point cloud
         self.points = []
@@ -75,6 +78,24 @@ class Adar:
 
         return np.stack((x, y, z), axis=-1)
     
+    def _create_camera(self):
+        """
+        Creates a camera at the sensor origin for visualization purposes.
+        """
+        camera_prim = self._stage.GetPrimAtPath(self._camera_path)
+
+        if camera_prim.IsValid():
+            return
+        
+        camera_prim = UsdGeom.Camera.Define(self._stage, Sdf.Path(self._camera_path))
+
+        # Place the camera relative to the sensor frame
+        cam_xform = UsdGeom.Xformable(camera_prim.GetPrim())
+        cam_xform.ClearXformOpOrder()
+
+        cam_xform.AddTranslateOp().Set(Gf.Vec3d(0.0, 0.0, 0.0))
+        cam_xform.AddRotateXYZOp().Set(Gf.Vec3f(90.0, 0.0, 90.0))
+        
     def _is_orthogonal_to_normal(self, ray_dir, normal, threshold=0.1):
         d = np.asarray(ray_dir, dtype=np.float32)
         n = np.asarray(normal, dtype=np.float32)
