@@ -366,6 +366,12 @@ class Adar:
         hess_f = quadratic_hessian_fn_from_theta(theta)
 
         return f, grad_f, hess_f
+
+    def reflection_intensity(self, points, wave_length):
+        k = 4 * np.pi / wave_length
+        F = np.sum(np.exp(1j * k * 2 * (np.asarray(points) - np.asarray(self.origin))))
+        intensity = abs(F)**2
+        return intensity
     
     def evaluate_surface_curvature(self, grad_f, hess_f, center_point):
         """
@@ -388,13 +394,46 @@ class Adar:
         We are unable to diferentiate between a parabolic point (eg. cylinder) and a planar point with just K.
         For H we can have a planar point with H = 0, but also a saddle point with H = 0.
         """
-        pass
 
-    def reflection_intensity(self, points, wave_length):
-        k = 4 * np.pi / wave_length
-        F = np.sum(np.exp(1j * k * 2 * (np.asarray(points) - np.asarray(self.origin))))
-        intensity = abs(F)**2
-        return intensity
+        def gaussian_curvature(grad_f, hess_f, x, y, z):
+            g = np.asarray(grad_f(x, y, z), dtype=np.float64)
+            H = np.asarray(hess_f(x, y, z), dtype=np.float64)
+ 
+            grad_norm = np.linalg.norm(g)
+ 
+            # Build adjugate (transpose of cofactor matrix) of H
+            adj_H = np.zeros((3, 3), dtype=np.float64)
+            for i in range(3):
+                for j in range(3):
+                    minor = np.delete(np.delete(H, i, axis=0), j, axis=1)
+                    adj_H[j, i] = ((-1) ** (i + j)) * np.linalg.det(minor)
+ 
+            K = float(g @ adj_H @ g) / (grad_norm ** 4)
+            return K
+
+        def mean_curvature(grad_f, hess_f, x, y, z):
+            g = np.asarray(grad_f(x, y, z), dtype=np.float64)
+            H = np.asarray(hess_f(x, y, z), dtype=np.float64)
+ 
+            grad_norm = np.linalg.norm(g)
+ 
+            numerator = float(g @ H @ g) - (grad_norm ** 2) * np.trace(H)
+            mean_H = numerator / (2.0 * grad_norm ** 3)
+            return mean_H
+ 
+        x, y, z = center_point[0], center_point[1], center_point[2]
+ 
+        K = gaussian_curvature(grad_f, hess_f, x, y, z)
+        H = mean_curvature(grad_f, hess_f, x, y, z)
+ 
+        # Recover principal curvatures from K and H:
+        #   k_1, k_2 = H ± sqrt(H^2 - K)
+        discriminant = max(H ** 2 - K, 0.0)
+        sqrt_disc = np.sqrt(discriminant)
+        k1 = H + sqrt_disc
+        k2 = H - sqrt_disc
+ 
+        return K, H, k1, k2
         
 
     def _draw_probe_points(self, probe_points):
@@ -474,6 +513,11 @@ def update(dt: float):
 
             intensity = adar.reflection_intensity(probe_points, adar.wave_length)
             points.append((hit, intensity))
+
+            _, grad_f, hess_f = adar.surface_interpolation(probe_points, probe_normals)
+            K, H, k_1, k_2 = adar.evaluate_surface_curvature(grad_f, hess_f, hit)
+
+            points.append(hit)
 
     adar._draw_points(points)
 
