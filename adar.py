@@ -1,5 +1,6 @@
 import carb
 import numpy as np 
+from shapely import Point
 
 from isaacsim.core.api import World
 from isaacsim.core.simulation_manager import SimulationManager, IsaacEvents
@@ -20,9 +21,63 @@ _OPPOSING_PAIRS = [
 
 ]
 
+class Hit:
+    def __init__(self, point: Point, normal: Point) -> None:
+        self.point = point
+        self.normal = normal
+
+class Hits:
+    def __init__(self) -> None:
+        self.hits: list[Hit] = []
+    
+    def append(self, hit: Hit) -> None:
+        self.hits.append(hit)
+
+    def points(self) -> list[Point]:
+        return [hit.point for hit in self.hits]
+
+    def normals(self) -> list[Point]:
+        return [hit.normal for hit in self.hits]
+
+    def __iter__(self):
+        return iter(self.hits)
+
+class Line:
+    def __init__(self, start: Point, end: Point) -> None:
+        self.line = (start, end)
+
+    def start(self) -> Point:
+        return self.line[0]
+    
+    def end(self) -> Point:
+        return self.line[1]
+
+    def direction(self) -> np.ndarray:
+        d = np.array([
+            self.end().x - self.start().x,
+            self.end().y - self.start().y,
+            self.end().z - self.start().z,], dtype=np.float32
+        )
+
+        return d / np.linalg.norm(d)
+
+class Lines:
+    def __init__(self, lines: list[Line]) -> None:
+        self.lines: list[Line] = lines
+
+    @classmethod
+    def from_origin_to_endpoints(cls, origin: Point, endpoints: list[Point]): 
+        """
+        Build Lines from a shared origin and a list of endpoints.
+        """
+        return cls([Line(origin, ep) for ep in endpoints])
+
+    def __iter__(self):
+        return iter(self.lines)
+
 class Adar:
-    def __init__(self, origin=(0.0, 0.0, 1.0), max_range=5.0, num_points=5000, wave_length=0.1):
-        self.origin = carb.Float3(*map(float, origin))
+    def __init__(self, origin=Point(0.0, 0.0, 1.0), max_range=5.0, num_points=5000, wave_length=0.1):
+        self.origin: Point = origin
         self.max_range = max_range
         self.num_points = num_points
         self.wave_length = wave_length
@@ -76,7 +131,8 @@ class Adar:
         y = np.cos(lat) * np.sin(lon)
         z = np.sin(lat)
 
-        return np.stack((x, y, z), axis=-1)
+        endpoints = [Point(float(xi), float(yi), float(zi)) for (xi, yi, zi) in zip(x, y, z)]
+        return Lines.from_origin_to_endpoints(self.origin, endpoints)
     
     def _create_camera(self):
         """
@@ -113,22 +169,25 @@ class Adar:
         return abs(dot) < threshold
 
     def _scan(self):
-        hits = []
-        hits_normals = []
-        for dir in self._dirs:
-            hit = self._scene_query.raycast_closest(self.origin, dir, self.max_range)
+        hits = Hits()
+        for line in self._dirs:
+            ray = self._scene_query.raycast_closest(line.start, line.end, self.max_range)
 
-            if not hit['hit']:
+            if not ray['hit']:
                 continue
 
+            p = ray["position"]
+            n = ray["normal"]
 
-            n = hit["normal"]
-            if self._is_parallel_to_normal(dir, n, self.ortho_tol):
-                p = hit["position"]
-                hits.append((float(p[0]), float(p[1]), float(p[2])))
-                hits_normals.append((float(n[0]), float(n[1]), float(n[2])))
+            point = Point(float(p[0]), float(p[1]), float(p[2]))
+            normal = Point(float(n[0]), float(n[1]), float(n[2]))
+
+            hit = Hit(point, normal)
+
+            if self._is_parallel_to_normal(line.direction, n, self.ortho_tol):
+                hits.append(hit)
         
-        return hits, hits_normals
+        return hits
 
     def is_clean_edge(self, point_of_interest, probe_points, probe_normals, threshold=0.1):
         """
@@ -178,7 +237,7 @@ class Adar:
         dot = float(np.dot(n1, n2))
         return abs(dot) > (1 - threshold)
 
-    def build_3x3_probe(self, point_of_interest):
+    def build_3x3_probe(self, point_of_interest: Point) -> Lines:
         """
         Builds a 3x3 grid of probe points around the given point of interest.
         The offset plane is perpendicular to the ray direction at the point of interest, so all probe rays are parallel 
@@ -192,7 +251,7 @@ class Adar:
 
         axis1, axis2 = self._axes_from_direction(ray_dir)
 
-        probe_rays = []
+        probe_rays: list[Line] = []
         probe_spacing = self.wave_length / 2
         for i in range(-1, 2):
             for j in range(-1, 2):
@@ -202,20 +261,22 @@ class Adar:
                 offset = axis1 * i * probe_spacing + axis2 * j * probe_spacing
                 probe_origin = origin + offset
                 probe_point = poi + offset
-                probe_rays.append((probe_origin, probe_point))
 
-        return probe_rays
+                probe_ray = Line(Point(probe_origin), Point(probe_point))
+                probe_rays.append(probe_ray)
+
+        return Lines(probe_rays)
         
     def check_hit(self, hit):
         if hit['hit']:
             return True
         return False
     
-    def floor_filter(self, point, floor_height=0.01):
+    def floor_filter(self, point: Point, floor_height=0.01):
         """
         Returns True if the point is above the floor height.
         """
-        return point[2] > floor_height
+        return point.z > floor_height
 
     def _axes_from_direction(self, dir):
         """
@@ -489,35 +550,33 @@ def update(dt: float):
 
     points = []
 
-    hits, hit_normals = adar._scan()
-    for (hit, hit_normal) in zip(hits, hit_normals):
-        if not adar.floor_filter(hit, floor_height=0.01):
+    hits = adar._scan()
+    for hit in hits:
+        if not adar.floor_filter(hit.point, floor_height=0.01):
             continue
 
-        probe_rays = adar.build_3x3_probe(hit)
-        probe_hits = []
+        probe_rays = adar.build_3x3_probe(hit.point)
+        probe_hits = Hits()
 
-        for probe_origin, probe_target in probe_rays:
-            dir = probe_target - probe_origin
-            probe_hit = adar._scene_query.raycast_closest(probe_origin, dir, adar.max_range)
+        for ray in probe_rays:
+            probe_hit = adar._scene_query.raycast_closest(ray.start, ray.direction, adar.max_range)
             if not adar.check_hit(probe_hit):
                 break
 
+            p = Point(probe_hit["position"])
+            n = Point(probe_hit["normal"])
+
+            probe_hit = Hit(p, n)
             probe_hits.append(probe_hit)
 
         else:
-            probe_points = [hit["position"] for hit in probe_hits]
-            probe_normals = [hit["normal"] for hit in probe_hits]
-            probe_points.append(hit)
-            probe_normals.append(hit_normal)
+            probe_hits.append(hit)
 
-            intensity = adar.reflection_intensity(probe_points, adar.wave_length)
+            intensity = adar.reflection_intensity(probe_hits.points(), adar.wave_length)
             points.append((hit, intensity))
 
-            _, grad_f, hess_f = adar.surface_interpolation(probe_points, probe_normals)
+            _, grad_f, hess_f = adar.surface_interpolation(probe_hits.points, probe_hits.normals)
             K, H, k_1, k_2 = adar.evaluate_surface_curvature(grad_f, hess_f, hit)
-
-            points.append(hit)
 
     adar._draw_points(points)
 
