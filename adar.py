@@ -21,12 +21,12 @@ _OPPOSING_PAIRS = [
 ]
 
 class Adar:
-    def __init__(self, origin=(0.0, 0.0, 1.0), max_range=5.0, num_points=5000, wave_length=0.1):
+    def __init__(self, origin=(0.0, 0.0, 1.0), max_range=5.0, num_points=5000, wave_length=0.002):
         self.origin = carb.Float3(*map(float, origin))
         self.max_range = max_range
         self.num_points = num_points
         self.wave_length = wave_length
-        self.ortho_tol = 0.02 # cosine of angle threshold for orthogonality (eg. 0.02 ~ 88.85 degrees)
+        self.ortho_tol = 0.1 # cosine of angle threshold for orthogonality (eg. 0.02 ~ 88.85 degrees)
 
         self._stage = omni.usd.get_context().get_stage()
         self._sensor_path = "/World/AdarSensor"
@@ -188,14 +188,15 @@ class Adar:
         poi = np.asarray(point_of_interest, dtype=np.float32)
 
         ray_dir = poi - origin
-        ray_dir /= np.linalg.norm(ray_dir)
+        ray_len = np.linalg.norm(ray_dir)
+        ray_dir /= ray_len
 
         axis1, axis2 = self._axes_from_direction(ray_dir)
-
+        n = 3
         probe_rays = []
-        probe_spacing = self.wave_length / 2
-        for i in range(-1, 2):
-            for j in range(-1, 2):
+        probe_spacing = self.wave_length / 1.0 * ray_len /n
+        for i in range(-n, n+1):
+            for j in range(-n, n+1):
                 if i == 0 and j == 0:
                     continue
 
@@ -368,9 +369,12 @@ class Adar:
         return f, grad_f, hess_f
 
     def reflection_intensity(self, points, wave_length):
-        k = 4 * np.pi / wave_length
-        F = np.sum(np.exp(1j * k * 2 * (np.asarray(points) - np.asarray(self.origin))))
-        intensity = abs(F)**2
+        k = 2 * np.pi / wave_length
+        p = np.asarray(points)
+        o = np.asarray(self.origin)
+        s = np.sqrt(np.sum(np.power((p-o),2), axis=1))
+        F = np.sum(np.exp(1j * k * 2 * s))
+        intensity = abs(F)**2 / s.size ** 2
         return intensity
     
     def evaluate_surface_curvature(self, grad_f, hess_f, center_point):
@@ -450,7 +454,7 @@ class Adar:
         # draw all hits as red points
         pts = [carb.Float3(x, y, z) for (x, y, z), _ in points]
         colors = [carb.ColorRgba(1.0, 0.0, 0.0, 1.0) for _, _ in points]
-        sizes  = [intensity * 0.05 for _, intensity in points]
+        sizes  = [intensity * 10.0 for _, intensity in points]
 
         points.extend(pts)
         colors.extend(colors)
@@ -514,10 +518,10 @@ def update(dt: float):
             intensity = adar.reflection_intensity(probe_points, adar.wave_length)
             points.append((hit, intensity))
 
-            _, grad_f, hess_f = adar.surface_interpolation(probe_points, probe_normals)
-            K, H, k_1, k_2 = adar.evaluate_surface_curvature(grad_f, hess_f, hit)
+            #_, grad_f, hess_f = adar.surface_interpolation(probe_points, probe_normals)
+            #K, H, k_1, k_2 = adar.evaluate_surface_curvature(grad_f, hess_f, hit)
 
-            points.append(hit)
+            #points.append(hit)
 
     adar._draw_points(points)
 
