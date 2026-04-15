@@ -175,7 +175,7 @@ class ClusteringStepStrategy(AdarStepStrategy):
             Checks if the reflected ray direction is valid (i.e. it points back towards the sensor plane).
             """
             plane_normal = adar.direction
-            return np.dot(reflected_dir, plane_normal) > 0
+            return np.dot(reflected_dir, plane_normal) < 0
         
         def sensor_plane_hit_point(reflected_dir: np.ndarray, hit_position: np.ndarray) -> np.ndarray:
             """
@@ -221,7 +221,7 @@ class ClusteringStepStrategy(AdarStepStrategy):
             ray_dir = position - ray_origin
             ray_dir = ray_dir / np.linalg.norm(ray_dir)
 
-            if np.dot(ray_dir, hit_normal) <= 0:
+            if np.dot(ray_dir, hit_normal) > 0:
                 hit_normal = -hit_normal
 
             score = score_function(reflected_hit_distance_sensor_plane(ray_origin, position, hit_normal))
@@ -258,7 +258,7 @@ class ClusteringStepStrategy(AdarStepStrategy):
                 hit_normal = np.asarray(refelction_hit["normal"], dtype=np.float32)
                 
                 hit_normal = hit_normal / np.linalg.norm(hit_normal)
-                if np.dot(ray_dir, hit_normal) <= 0:
+                if np.dot(ray_dir, hit_normal) > 0:
                     hit_normal = -hit_normal
 
                 ray_origin = current_hit
@@ -271,7 +271,8 @@ class ClusteringStepStrategy(AdarStepStrategy):
                 pending_bounces[0].append(tuple(ray_origin))
                 pending_bounces[1].append(tuple(hit_position))
 
-                if score > 0.1 and is_valid_refelction(ray_dir):
+                outgoing_reflection_dir = reflection_direction(ray_dir, current_normal)
+                if score > 0.1 and is_valid_refelction(outgoing_reflection_dir):
                     last_ray_dir = ray_dir
 
                     total_distances_traveled = distance_traveled + np.linalg.norm(hit_position - origin)
