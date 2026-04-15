@@ -521,10 +521,6 @@ def update(dt: float):
             #_, grad_f, hess_f = adar.surface_interpolation(probe_points, probe_normals)
             #K, H, k_1, k_2 = adar.evaluate_surface_curvature(grad_f, hess_f, hit)
 
-            #points.append(hit)
-
-    adar._draw_points(points)
-
 physics_cb_id = None
 ready_cb_id = None
 
