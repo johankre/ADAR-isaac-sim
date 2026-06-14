@@ -1,5 +1,8 @@
 from abc import ABC, abstractmethod
+import asyncio
 from dataclasses import dataclass
+
+from shapely import points
 
 from isaacsim.core.api import World
 from isaacsim.core.simulation_manager import SimulationManager, IsaacEvents
@@ -8,7 +11,7 @@ from isaacsim.util.debug_draw import _debug_draw
 import omni
 import omni.timeline
 
-from pxr import Gf, Sdf, UsdPhysics
+from pxr import Gf, Sdf, Usd, UsdPhysics
 
 import carb
 import numpy as np 
@@ -17,13 +20,15 @@ from sklearn.cluster import DBSCAN
 
 import omni
 from omni.physx import get_physx_scene_query_interface
+import omni.kit.raycast.query
 
-from pxr import Gf, Sdf, UsdGeom
+from pxr import Gf, Sdf, UsdGeom, Vt
 
 @dataclass
 class Point:
     position: np.ndarray
-    normal: float
+    score: float
+
 
 class AdarStepStrategy(ABC):
     @abstractmethod
@@ -32,54 +37,231 @@ class AdarStepStrategy(ABC):
         Executes a a given process for point cloud generation.
         """
         raise NotImplementedError("AdarStepStrategy is an abstract base class and cannot be instantiated directly.")
-    
-class IntensityStepStrategy(AdarStepStrategy):
-    def execute(self, adar):
-        def reflection_intensity(points, wave_length):
-            k = 2 * np.pi / wave_length
-            p = np.asarray(points, dtype=np.float32)
 
-            o = np.asarray(adar.origin, dtype=np.float32)
-            s = np.sqrt(np.sum(np.power(p - o, 2), axis=-1))
-            F = np.sum(np.exp(1j * k * 2 * s))
-            intensity = abs(F)**2 / s.size ** 2
+class AsyncClusteringStepStrategy(AdarStepStrategy):
+        def __init__(self, batch_size, num_workes=5):
+            self.batch_size = batch_size
+            self.num_workes = num_workes
 
-            return intensity
+            self.seq_queue = asyncio.Queue()
+            self.result_queue = asyncio.Queue()
 
-        adar._debug_draw.clear_points()
+            self.raycast_interface = omni.kit.raycast.query.acquire_raycast_query_interface()
+        
+        def build_ray_batches(self, adar):
+            """
+            origin: (3,)
+            directions: (N, 3)
+            """
 
-        points = []
+            rays = []
+            origin = np.asarray(adar.origin, dtype=np.float32)
 
-        hits, hit_normals = adar._scan()
-        for (hit, hit_normal) in zip(hits, hit_normals):
-            if not adar.floor_filter(hit, floor_height=0.01):
-                continue
+            # create Ray objects
+            for d in adar._dirs:
+                rays.append(
+                    omni.kit.raycast.query.Ray(
+                        origin,
+                        tuple(d),
+                    )
+                )
 
-            probe_rays = adar.build_3x3_probe(hit)
-            probe_hits = []
+            # chunk into batches
+            for i in range(0, len(rays), self.batch_size):
+                yield rays[i:i + self.batch_size]
 
-            for probe_origin, probe_target in probe_rays:
-                dir = probe_target - probe_origin
-                probe_hit = adar._scene_query.raycast_closest(probe_origin, dir, adar.max_range)
-                if not adar.check_hit(probe_hit):
+
+        def submit_batch(self, rays):
+            seq_id = self.raycast_interface.add_raycast_sequence()
+            self.raycast_interface.submit_raycast_sequence(seq_id, rays)
+            return seq_id
+
+        async def poll(self):
+            seq_ids = set()
+
+            while True:
+
+                try:
+                    while True:
+                        seq_id = self.seq_queue.get_nowait()
+                        if seq_id is None:
+                            return
+                        seq_ids.add(seq_id)
+                except asyncio.QueueEmpty:
+                    pass
+
+                for seq_id in list(seq_ids):
+                    error, seq_rays, result = self.raycast_interface.get_latest_result_from_raycast_sequence_array(seq_id)
+
+                    if error == omni.kit.raycast.query.Result.SUCCESS:
+                        await self.result_queue.put((seq_id, result))
+                        seq_ids.remove(seq_id)
+                
+                await omni.kit.app.get_app().next_update_async()
+
+
+        async def worker(self, worker_id):
+
+            while True:
+                item = await self.result_queue.get()
+
+                if item is None:
                     break
 
-                probe_hits.append(probe_hit)
+                seq_id, result = item
 
-            else:
-                probe_points = [hit["position"] for hit in probe_hits]
-                probe_normals = [hit["normal"] for hit in probe_hits]
-                probe_points.append(hit)
-                probe_normals.append(hit_normal)
+                for ray_result in result:
+                    if ray_result['hit']:
+                        print(f"Worker {worker_id} got hit at {ray_result['hit_position']} with normal {ray_result['hit_normal']}")
 
-                intensity = reflection_intensity(probe_points, adar.wave_length)
-                points.append((hit, intensity))
+        async def execute(self, adar):
+            adar._debug_draw.clear_points()
+
+            # start the polling task
+            poll_task = asyncio.create_task(self.poll())
+
+            # start the worker tasks
+            workers = [
+                asyncio.create_task(self.worker(worker_id))
+                for worker_id in range(self.num_workes)
+            ]
+
+            for batch in self.build_ray_batches(adar):
+                seq_id = self.submit_batch(batch)
+                self.seq_queue.put_nowait(seq_id)
+
+            
+            await self.seq_queue.put(None)  # signal the poller to stop
+            for _ in workers:
+                await self.result_queue.put(None)  # signal the workers to stop
+            
+class IntensityLogger:
+    def __init__(self):
+        self.filename = "intensity_hits.csv"
+        self._file = open(self.filename, "w")
+        self._file.write("radius,x,y,z,intensity, field_intensity, field_amplitude\n")
+        self.radius = 0.0
+    
+    def log_hit(self, hit, intensity, field_intensity, field_amplitude):
+        x, y, z = hit[0], hit[1], hit[2]
+        self._file.write(f"{self.radius},{x},{y},{z},{intensity},{field_intensity},{field_amplitude}\n")
+
+    def set_radius(self, radius):
+        self.radius = radius
+
+    def close(self):
+        self._file.close()
+
+class IntensityStepStrategy(AdarStepStrategy):
+    def __init__(self):
+        self.detector_width = 0.05
+        self.samples_per_wavelength = 12
+        self.logger = IntensityLogger()
+
+    def execute(self, adar):
+        def _orthonormal_basis(self, dir):
+            dir = np.array(dir, dtype=np.float64)
+            dir = dir / np.linalg.norm(dir)
+            ref = np.array([0, 0, 1], dtype=np.float64) if abs(dir[2]) < 0.99 else np.array([0, 1, 0], dtype=np.float64)
+            u = np.cross(dir, ref)
+            v = np.cross(dir, u)
+            return u, v
+
+        def _sample_surface(self, adar, sensor_origin, patch_center, patch_normal, half_extend, spacing):
+            u, v = _orthonormal_basis(self, patch_normal)
+            n = max(2, int(np.ceil(2 * half_extend / spacing)))
+            coords = np.linspace(-half_extend, half_extend, n)
+            dS = (2 * half_extend / (n - 1)) ** 2
+
+            points = []
+            normals = []
+            for a in coords:
+                for b in coords:
+                    target = patch_center + a * u + b * v       # grid point in the patch plane
+                    ray_dir = target - sensor_origin            # cast FROM the sensor
+                    ray_dir = ray_dir / np.linalg.norm(ray_dir)
+
+                    hit = adar._scene_query.raycast_closest(sensor_origin, ray_dir, adar.max_range)
+                    if adar.check_hit(hit):
+                        points.append((float(hit["position"][0]), float(hit["position"][1]), float(hit["position"][2])))
+                        normals.append((float(hit["normal"][0]), float(hit["normal"][1]), float(hit["normal"][2])))
+
+            return points, normals, dS
+
+        
+        def _kirchoff_sum(self, origin, points, normals, dS, wave_length):
+            points = np.asarray(points, dtype=np.float64)   # (N, 3) explicit
+            normals = np.asarray(normals, dtype=np.float64)  # (N, 3) explicit
+            origin = np.asarray(origin, dtype=np.float64)   # (3,)
+
+            k = 2 * np.pi / wave_length
+            dir = points - origin                            
+
+            dir_norm = np.linalg.norm(dir, axis=-1, keepdims=True)
+            r_hat = dir / dir_norm
+            n_hat = normals / np.linalg.norm(normals, axis=-1, keepdims=True)
+
+            cos_obliq = np.sum(r_hat * n_hat, axis=-1)
+            phase = np.exp(1j * k * 2 * dir_norm[:, 0])
+            contribution = cos_obliq * phase * dS / (dir_norm[:, 0] ** 2)
+            return np.sum(contribution)
+        
+        wl = adar.wave_length
+        origin = np.asarray(adar.origin, dtype=np.float64)
+
+        dir = np.asarray(adar.direction, dtype=np.float64)
+
+        center_hit = adar._scene_query.raycast_closest(adar.origin, carb.Float3(dir[0], dir[1], dir[2]), adar.max_range)
+        cp = np.asarray(center_hit["position"], dtype=np.float64)
+        normal = np.asarray(center_hit["normal"], dtype=np.float64)
+        s = np.linalg.norm(cp - origin)
+
+        coherence_width =  s * wl / self.detector_width
+        half_extend = coherence_width / 2
+
+        spacing = wl / self.samples_per_wavelength
+        points, normals, dS = _sample_surface(self, adar, origin, cp, normal, half_extend, spacing)
+        W = _kirchoff_sum(self, origin, points, normals, dS, wl)
+        intensity = np.abs(W) ** 2
+
+        self.logger.log_hit(cp, intensity, np.abs(W), np.sqrt(intensity))
 
 
-        adar._draw_points(points)
+class ClusteringLogger:
+    def __init__(self):
+        self.filename = "57815.csv"
+        self._file = open(self.filename, "w")
+        self._file.write("x,y,z,score,cluster_id\n")
+
+    def log_hit(self, hit, score, cluster_id):
+        x, y, z = hit[0], hit[1], hit[2]
+        self._file.write(f"{x},{y},{z},{score},{cluster_id}\n")
+    
+    def close(self):
+        self._file.close()
 
 class ClusteringStepStrategy(AdarStepStrategy):
+    def __init__(self):
+        self.logger = ClusteringLogger()
+
     def execute(self, adar):
+
+        TARGET_PRIM_PATHS = (
+            "/World/c638e5d6_0697_11ef_b025_b04f13dd02fd",      # person
+            "/World/PourInPlaceSafetyBollard_A02_01",            # safety bollard
+            "/World/Cylinder",
+            "/World/Cylinder_01",
+            "/World/Cube",
+            "/World/WetFloorSign_B02_PR_NVD_01",
+        )
+
+        def is_target(prim_path: str) -> bool:
+            if not prim_path:
+                return False
+            return any(prim_path == t or prim_path.startswith(t + "/") for t in TARGET_PRIM_PATHS)
+
+        def hit_prim(hit) -> str:
+            return str(hit.get("collision", "") or hit.get("rigidBody", "") or "")
 
         def theta(position: np.ndarray, normal: np.ndarray):
             """
@@ -157,19 +339,53 @@ class ClusteringStepStrategy(AdarStepStrategy):
             distance = np.linalg.norm(intersection - sensor_origin)
             return float(distance)
         
-        def score_function(dist: float, sigma=0.5):
+        def score_function(dist: float, sigma=0.3) -> float:
             """
             Computes a score based on the distance of the reflected hit, where closer hits get higher scores.
             """
             return np.exp(- (dist ** 2) / (sigma ** 2))
         
-        def cluster_hits(hits: np.ndarray, eps=0.5, min_samples=5):
+        def cluster_hits(hits: np.ndarray, eps=0.001, min_samples=5):
             """
             Clusters the hit points using DBSCAN and returns the cluster labels.
             """
             clustering = DBSCAN(eps=eps, min_samples=min_samples).fit(hits)
             return clustering.labels_
         
+        # AI Gen
+        def is_path_clear(start: np.ndarray, end: np.ndarray, ray_bias=1e-2):
+            """
+            Returns True if the straight segment from `start` to `end` is not blocked
+            by any geometry, i.e. the reflected ray can actually travel back to the
+            sensor plane without passing through an object.
+ 
+            We cast a ray from `start` towards `end` and treat the path as occluded
+            only if something is hit *before* we reach `end`. A small bias offsets the
+            origin off the surface to avoid self-intersection, and a small `slack`
+            tolerates floating point error / hitting the target surface itself.
+            """
+            start = np.asarray(start, dtype=np.float32)
+            end = np.asarray(end, dtype=np.float32)
+ 
+            seg = end - start
+            dist = float(np.linalg.norm(seg))
+            if dist < 1e-6:
+                return True
+ 
+            seg_dir = seg / dist
+ 
+            # Offset slightly off the originating surface to avoid self hits.
+            biased_origin = start + seg_dir * ray_bias
+ 
+            occ_hit = adar._scene_query.raycast_closest(
+                carb.Float3(float(biased_origin[0]), float(biased_origin[1]), float(biased_origin[2])),
+                carb.Float3(float(seg_dir[0]), float(seg_dir[1]), float(seg_dir[2])),
+                dist,
+            )
+ 
+            if not adar.check_hit(occ_hit):
+                return True 
+            
         def is_valid_refelction(reflected_dir: np.ndarray) -> bool:
             """
             Checks if the reflected ray direction is valid (i.e. it points back towards the sensor plane).
@@ -198,12 +414,13 @@ class ClusteringStepStrategy(AdarStepStrategy):
         adar._debug_draw.clear_points()
         adar._debug_draw.clear_lines()
 
+        min_score_threshold = 0.32
         hits, hit_normals = adar._scan_all()
         origin = np.asarray(adar.origin, dtype=np.float32)
 
         hits = np.asarray(hits, dtype=np.float32)
         hit_normals = np.asarray(hit_normals, dtype=np.float32)
-        hit_normals = hit_normals / np.linalg.norm(hit_normals)
+        hit_normals = hit_normals / np.linalg.norm(hit_normals, axis=-1, keepdims=True)
 
         point_items: list[Point] = []
 
@@ -225,8 +442,8 @@ class ClusteringStepStrategy(AdarStepStrategy):
                 hit_normal = -hit_normal
 
             score = score_function(reflected_hit_distance_sensor_plane(ray_origin, position, hit_normal))
-            if score > 0.1:
-                point_items.append(Point(position=position, normal=score))
+            if score > min_score_threshold:
+                point_items.append(Point(position=position, score=score))
                 continue
             
             distance_traveled = np.linalg.norm(position - ray_origin)
@@ -246,13 +463,16 @@ class ClusteringStepStrategy(AdarStepStrategy):
                 ray_dir = reflection_direction(prev_ray_dir, current_normal)
 
                 # Offset the ray origin slightly away from the surface to avoid self-intersection
-                ray_bias = 1e-2
+                ray_bias = 1e-3
                 biased_ray_origin = current_hit + ray_dir * ray_bias
 
                 refelction_hit = adar._scene_query.raycast_closest(biased_ray_origin, ray_dir, (adar.max_range * 2 - distance_traveled) / 2)
+                bounce_prim = hit_prim(refelction_hit)
 
                 if not adar.check_hit(refelction_hit):
                     break
+                if not is_target(bounce_prim):
+                        break
 
                 hit_position = np.asarray(refelction_hit["position"], dtype=np.float32)
                 hit_normal = np.asarray(refelction_hit["normal"], dtype=np.float32)
@@ -272,13 +492,16 @@ class ClusteringStepStrategy(AdarStepStrategy):
                 pending_bounces[1].append(tuple(hit_position))
 
                 outgoing_reflection_dir = reflection_direction(ray_dir, current_normal)
-                if score > 0.1 and is_valid_refelction(outgoing_reflection_dir):
-                    last_ray_dir = ray_dir
+                if score > min_score_threshold and is_valid_refelction(outgoing_reflection_dir):
+                    plane_pt = sensor_plane_hit_point(outgoing_reflection_dir, current_hit)
+                    if not is_path_clear(current_hit, plane_pt):
+                        break
 
                     total_distances_traveled = distance_traveled + np.linalg.norm(hit_position - origin)
                     psuedo_direction = (hit_position - origin) / np.linalg.norm(hit_position - origin)
                     estimated_postion = origin + psuedo_direction * (total_distances_traveled / 2)
-                    point_items.append(Point(position=estimated_postion, normal=score))
+
+                    point_items.append(Point(position=estimated_postion, score=score))
                 
                     # Segment 1: sensor origin → first surface hit (yellow)
                     lines_origin_to_first[0].append(tuple(origin))
@@ -297,39 +520,93 @@ class ClusteringStepStrategy(AdarStepStrategy):
                     break
 
 
-        # Draw all three path segments in distinct colours
-        if lines_origin_to_first[0]:
-            adar._draw_lines(*lines_origin_to_first, carb.ColorRgba(1.0, 1.0, 0.0, 1.0), size=1.5)  # yellow
-        if lines_bounces[0]:
-            adar._draw_lines(*lines_bounces,         carb.ColorRgba(0.0, 1.0, 1.0, 1.0), size=1.5)  # cyan
-        if lines_to_plane[0]:
-            adar._draw_lines(*lines_to_plane,        carb.ColorRgba(1.0, 0.0, 1.0, 1.0), size=1.5)  # magenta
-
-
 
         if len(point_items) == 0:
             return
 
         positions = np.asarray([p.position for p in point_items], dtype=np.float32)
-        scores = np.asarray([p.normal for p in point_items], dtype=np.float32)
-        labels = cluster_hits(positions, eps=0.5, min_samples=2)
+        scores = np.asarray([p.score for p in point_items], dtype=np.float32)
+        labels = cluster_hits(positions, eps=0.05, min_samples=2)
+
+        points = []
+        colors_list = [
+            carb.ColorRgba(1.0, 0.0, 0.0, 1.0),  # red
+            carb.ColorRgba(0.0, 1.0, 0.0, 1.0),  # green
+            carb.ColorRgba(0.0, 0.0, 1.0, 1.0),  # blue
+            carb.ColorRgba(1.0, 1.0, 0.0, 1.0),  # yellow
+            carb.ColorRgba(1.0, 0.0, 1.0, 1.0),  # magenta
+            carb.ColorRgba(0.0, 1.0, 1.0, 1.0),  # cyan
+            carb.ColorRgba(0.5, 0.5, 0.5, 1.0),  # gray for noise
+        ]
+        for i, pos in enumerate(positions):
+            label = labels[i]
+            if label == -1:
+                color = colors_list[-1]  # gray
+            else:
+                color = colors_list[label % (len(colors_list)-1)]
+            size = scores[i] * 10
+            points.append( (pos, color, size) )
 
         unique_labels = np.unique(labels)
-        points = []
         for cluster_id in unique_labels:
             # ignore noise points labeled as -1 by DBSCAN
             if cluster_id == -1:
                 continue
 
+            print(f"Cluster {cluster_id}: {np.sum(labels == cluster_id)} points")
             cluster_points = positions[labels == cluster_id]
             cluster_weights = scores[labels == cluster_id]
             weighted_pos = np.average(cluster_points, axis=0, weights=cluster_weights)
-            points.append((weighted_pos, float(np.mean(cluster_weights)) * 2.0))
+            print(f"point at {weighted_pos} with average score {np.mean(cluster_weights)}")
+
+            center_color = carb.ColorRgba(1.0, 1.0, 1.0, 1.0) # white
+            center_size = float(np.mean(cluster_weights))  * 10
+            points.append((weighted_pos, center_color, center_size))
+            
+
+        adar._draw_lines(
+            lines_origin_to_first[0],
+            lines_origin_to_first[1],
+            carb.ColorRgba(1.0, 1.0, 0.0, 1.0),
+            size=2.0,
+        )
+        adar._draw_lines(
+            lines_bounces[0],
+            lines_bounces[1],
+            carb.ColorRgba(0.0, 1.0, 1.0, 1.0),
+            size=1.5,
+        )
+        adar._draw_lines(
+            lines_to_plane[0],
+            lines_to_plane[1],
+            carb.ColorRgba(1.0, 0.0, 1.0, 1.0),
+            size=2.0,
+        )
 
         adar._draw_points(points)
 
+class CurvatureLogger:
+    def __init__(self):
+        self.filename = "curvature_hits.csv"
+        self.radius = 0.0
+        self._file = open(self.filename, "w")
+        self._file.write("radius,x,y,z,intensity,k1,k2\n")
+
+    def log_hit(self, hit, intensity, k1, k2):
+        x, y, z = hit[0], hit[1], hit[2]
+        self._file.write(f"{self.radius},{x},{y},{z},{intensity},{k1},{k2}\n")
+    
+    def set_radius(self, radius):
+        self.radius = radius
+    
+    def close(self):
+        self._file.close()
+
 class CurvatureStepStrategy(AdarStepStrategy):
-    def surface_interpolation(self, points, normals):
+    def __init__(self):
+        self.logger = CurvatureLogger()
+
+    def surface_interpolation(self, points, normals, center):
         """
         Given a set of points and their corresponding normals (Hermite data), perform quadratic surface interpolation to
         estimate the surface in a given region centerd at the point of interest.
@@ -340,17 +617,20 @@ class CurvatureStepStrategy(AdarStepStrategy):
 
         returns f, grad_f, hess_f
         """
+        P = np.asarray(points, dtype=np.float64)
+        G = np.asarray(normals, dtype=np.float64)
+        center = np.asarray(center, dtype=np.float64)
 
-        def build_system_quadratic(points, normals):
-            P = np.asarray(points, dtype=np.float32)
-            G = np.asarray(normals, dtype=np.float32)
+        P1 = P - center
 
+
+        def build_system_quadratic(P, G):
             rows = []
             rhs = []
             for (x, y, z), (nx, ny, nz) in zip(P, G):
                 # f(x_i) = 0 constraints gives us: 
                 # per row: [x_i^2, y_i^2, z_i^2, x_i*y_i, x_i*z_i, y_i*z_i, x_i, y_i, z_i, 1] * [A11, A22, A33, A12, A13, A23, b1, b2, b3, c]^T = 0
-                row_f = [x**2, y**2, z**2, x*y, x*z, y*z, x, y, z, 1.0]
+                row_f = [x**2, y**2, z**2, 2*x*y, 2*x*z, 2*y*z, x, y, z, 1.0]
                 rows.append(row_f)
                 rhs.append(0.0)
 
@@ -371,8 +651,8 @@ class CurvatureStepStrategy(AdarStepStrategy):
                 rows.append(row_nz)
                 rhs.append(nz)
             
-            M = np.vstack(rows)
-            y = np.asarray(rhs, dtype=np.float32)
+            M = np.vstack(rows, dtype=np.float64)
+            y = np.asarray(rhs, dtype=np.float64)
 
             return M, y
         
@@ -387,10 +667,13 @@ class CurvatureStepStrategy(AdarStepStrategy):
             """
             Creates a quadratic function from the estimated parameters.
             """
-            theta = np.asarray(theta, dtype=np.float32).ravel()
+            theta = np.asarray(theta, dtype=np.float64).ravel()
             a11, a22, a33, a12, a13, a23, b1, b2, b3, c = theta
             
             def f(x, y, z):
+                x = x - center[0]
+                y = y - center[1]
+                z = z - center[2]   
                 return (a11 * x**2 + a22 * y**2 + a33 * z**2 + 
                         a12 * x * y + a13 * x * z + a23 * y * z + 
                         b1 * x + b2 * y + b3 * z + c)
@@ -401,10 +684,13 @@ class CurvatureStepStrategy(AdarStepStrategy):
             """
             Creates a gradient function from the estimated parameters.
             """
-            theta = np.asarray(theta, dtype=np.float32).ravel()
+            theta = np.asarray(theta, dtype=np.float64).ravel()
             a11, a22, a33, a12, a13, a23, b1, b2, b3, _ = theta
             
             def grad_f(x, y, z):
+                x = x - center[0]
+                y = y - center[1]
+                z = z - center[2]   
                 df_dx = 2 * a11 * x + a12 * y + a13 * z + b1
                 df_dy = 2 * a22 * y + a12 * x + a23 * z + b2
                 df_dz = 2 * a33 * z + a13 * x + a23 * y + b3
@@ -416,7 +702,7 @@ class CurvatureStepStrategy(AdarStepStrategy):
             """
             Creates a hessian function from the estimated parameters.
             """
-            theta = np.asarray(theta, dtype=np.float32).ravel()
+            theta = np.asarray(theta, dtype=np.float64).ravel()
             a11, a22, a33, a12, a13, a23, _, _, _, _ = theta
             
             def hess_f(x, y, z):
@@ -433,7 +719,7 @@ class CurvatureStepStrategy(AdarStepStrategy):
 
             return hess_f
 
-        M, y = build_system_quadratic(points, normals)
+        M, y = build_system_quadratic(P1, normals)
         theta, _, _, _ = solve_ls_quadratic(M, y)
 
         f = quadratic_fn_from_theta(theta)
@@ -504,9 +790,50 @@ class CurvatureStepStrategy(AdarStepStrategy):
  
         return K, H, k1, k2
     def execute(self, adar):
-                #_, grad_f, hess_f = adar.surface_interpolation(probe_points, probe_normals)
-                #K, H, k_1, k_2 = adar.evaluate_surface_curvature(grad_f, hess_f, hit)
-        raise NotImplementedError("CurvatureStepStrategy is not implemented yet.")
+        #adar._debug_draw.clear_points()
+
+        points = []
+
+        hits, hit_normals = adar._scan()
+        for (hit, hit_normal) in zip(hits, hit_normals):
+            if not adar.floor_filter(hit, floor_height=0.01):
+                continue
+
+            probe_rays = adar.build_3x3_probe(hit)
+            probe_hits = []
+
+            for probe_origin, probe_target in probe_rays:
+                dir = probe_target - probe_origin
+                probe_hit = adar._scene_query.raycast_closest(probe_origin, dir, adar.max_range)
+                if not adar.check_hit(probe_hit):
+                    break
+
+                probe_hits.append(probe_hit)
+
+            else:
+                probe_points = [hit["position"] for hit in probe_hits]
+                probe_normals = [hit["normal"] for hit in probe_hits]
+                probe_points.append(hit)
+                probe_normals.append(hit_normal)
+
+
+
+                _, grad_f, hess_f = self.surface_interpolation(probe_points, probe_normals, center=np.asarray(hit, dtype=np.float64))
+                _, _, k_1, k_2 = self.evaluate_surface_curvature(grad_f, hess_f, hit)
+                origin_np = np.asarray([adar.origin.x, adar.origin.y, adar.origin.z], dtype=np.float64)
+                r = max(float(np.linalg.norm(np.asarray(hit, dtype=np.float64) - origin_np)), 1e-3)
+
+                def relative_curvature(k, distance):
+
+                    return 1 / (1/distance - k)
+
+                c1 = relative_curvature(k_1, r)
+                c2 = relative_curvature(k_2, r)
+                intensity = np.sqrt(abs(c1 * c2)) * 1/r**2
+
+                self.logger.log_hit(hit, intensity, k_1, k_2)
+                #points.append((hit, intensity))
+        #adar._draw_points(points)
 
 class AdarRayDirectionStrategy():
     @abstractmethod
@@ -544,7 +871,7 @@ class PlaneScanStrategy(AdarRayDirectionStrategy):
         # If the scan direction is parallel to the local up vector, choose a different reference vector
         if np.allclose(d, up) or np.allclose(d, -up):
             up = np.array([0.0, 1.0, 0.0], dtype=np.float32)
-        
+
         # Compute orthogonal basis vectors for the scan plane
         right = np.cross(d, up)
         right /= np.linalg.norm(right)
@@ -557,6 +884,16 @@ class PlaneScanStrategy(AdarRayDirectionStrategy):
         dirs /= np.linalg.norm(dirs, axis=-1, keepdims=True)
 
         return dirs
+
+class ConeRayStrategy(AdarRayDirectionStrategy):
+    def __init__(self, cone_angle=0.0005):
+        self.cone_angle = cone_angle
+
+    def generate_directions(self, adar):
+        directions = []
+        for _ in range(adar.num_points):
+            directions.append([1, 0, 0])
+        return directions
 
 
 
@@ -576,32 +913,101 @@ STEP_STRATEGIES = {
 SCAN_STRATEGIES = {
     "uniform_sphere": UniformSphereStrategy(),
     "plane_scan": PlaneScanStrategy(),
+    "cone_ray": ConeRayStrategy(),
 }
 
 class Adar:
-    def __init__(self, origin=(0.0, 0.0, 2.0), max_range=5.0, num_points=10000, wave_length=0.002, step_strategy="intensity", scan_strategy="uniform_sphere"):
+    def __init__(self, origin=(-3.53, 1.5, 0.3), direction=(1, 0, 0.0), max_range=10.0, num_points=20_000_000, wave_length=0.02, step_strategy="intensity", scan_strategy="uniform_sphere"):
+        self.scan_strategy = SCAN_STRATEGIES.get(scan_strategy, SCAN_STRATEGIES["uniform_sphere"])
+        self.step_strategy = STEP_STRATEGIES.get(step_strategy, STEP_STRATEGIES["intensity"])
+
         self.origin = carb.Float3(*map(float, origin))
-        self.direction = np.array([1.0, 0.0, 0.0], dtype=np.float32)  # ADAR faces along the positive X-axis in its local frame
+
         self.max_range = max_range
         self.num_points = num_points
         self.wave_length = wave_length
-        self.scan_strategy = SCAN_STRATEGIES.get(scan_strategy, SCAN_STRATEGIES["uniform_sphere"])
         self.ortho_tol = 0.1
-        self.step_strategy = STEP_STRATEGIES.get(step_strategy, STEP_STRATEGIES["intensity"])
+
+        self._local_forward = np.array(direction, dtype=np.float32) / np.linalg.norm(direction)
+        self.direction = self._local_forward.copy()
+
+        self._local_dirs = self.scan_strategy.generate_directions(self)
+        self._dirs = self._local_dirs.copy()
 
         self._stage = omni.usd.get_context().get_stage()
         self._sensor_path = "/World/AdarSensor"
+        self._robot_body_path = "/World/spot/body"
         self._camera_path = self._sensor_path + "/Camera"
 
-        self._sensor_sphere(radius=0.1)
-        self._create_camera()
+        self._sensor_box()
+        #self._attach_sensor_to_robot() 
+        #self._create_camera()
 
         # filterd hits that represent the ADAR point cloud
         self.points = []
 
         self._debug_draw = _debug_draw.acquire_debug_draw_interface()
         self._scene_query = get_physx_scene_query_interface()
-        self._dirs = self.scan_strategy.generate_directions(self)
+
+    def _update_from_prim(self):
+        """Read live world transform from the sensor prim (works because it's a child of the robot)."""
+        prim = self._stage.GetPrimAtPath(self._sensor_path)
+        if not prim.IsValid():
+            return
+
+        xform_cache = UsdGeom.XformCache()  # no TimeCode = reads live Fabric state
+        world_xform = xform_cache.GetLocalToWorldTransform(prim)
+
+        t = world_xform.ExtractTranslation()
+        self.origin = carb.Float3(float(t[0]), float(t[1]), float(t[2]))
+
+        rot = world_xform.ExtractRotationMatrix()
+        rot_np = np.asarray(rot, dtype=np.float32).reshape((3, 3)).T
+        self.direction = rot_np @ self._local_forward
+        self._dirs = (rot_np @ self._local_dirs.T).T
+
+    def _attach_sensor_to_robot(self):
+        """
+        Creates a fixed joint between the robot chassis and the sensor prim,
+        so PhysX treats the sensor as rigidly bolted to the robot body.
+        """
+        joint_path = self._sensor_path + "/FixedJoint"
+        joint_prim = self._stage.GetPrimAtPath(joint_path)
+        if joint_prim.IsValid():
+            return
+
+        joint = UsdPhysics.FixedJoint.Define(self._stage, Sdf.Path(joint_path))
+        joint.CreateBody0Rel().SetTargets([Sdf.Path(self._robot_body_path)])
+        joint.CreateBody1Rel().SetTargets([Sdf.Path(self._sensor_path)])
+        joint.CreateLocalPos0Attr().Set(Gf.Vec3f(0.0, 0.0, 0.0))
+        joint.CreateLocalRot0Attr().Set(Gf.Quatf(1.0, 0.0, 0.0, 0.0))
+        joint.CreateLocalPos1Attr().Set(Gf.Vec3f(0.0, 0.0, 0.0))
+        joint.CreateLocalRot1Attr().Set(Gf.Quatf(1.0, 0.0, 0.0, 0.0))
+
+    def _sensor_box(self):
+        """
+        Creates a visual box at the sensor origin representing the sensor.
+        """
+        prim = self._stage.GetPrimAtPath(self._sensor_path)
+        if not prim.IsValid():
+            xform = UsdGeom.Xform.Define(self._stage, Sdf.Path(self._sensor_path))
+            xformable = UsdGeom.Xformable(xform.GetPrim())
+            xformable.ClearXformOpOrder()
+            xformable.AddTranslateOp().Set(
+                Gf.Vec3d(float(self.origin.x), float(self.origin.y), float(self.origin.z))
+            )
+
+            # Child box
+            box = UsdGeom.Cube.Define(self._stage, xform.GetPath().AppendChild("Box"))
+            box.CreateSizeAttr().Set(1.0)
+
+            box_xformable = UsdGeom.Xformable(box.GetPrim())
+            box_xformable.ClearXformOpOrder()
+
+            # Scale to matchbox proportions — thin in the forward axis, wider in the plane
+            box_xformable.AddScaleOp().Set(Gf.Vec3d(0.05, 0.2, 0.1))
+
+            box.CreateDisplayColorAttr().Set([(0.0, 0.4, 1.0)])  # Blue color
 
     def _sensor_sphere(self, radius=0.1):
         """
@@ -624,7 +1030,6 @@ class Adar:
             xformable.ClearXformOpOrder()
             t = xformable.AddTranslateOp()
             t.Set(Gf.Vec3d(float(self.origin.x), float(self.origin.y), float(self.origin.z)))
-
     
     def _create_camera(self):
         """
@@ -642,11 +1047,11 @@ class Adar:
         cam_xform.ClearXformOpOrder()
 
         cam_xform.AddTranslateOp().Set(Gf.Vec3d(0.0, 0.0, 0.0))
-        cam_xform.AddRotateXYZOp().Set(Gf.Vec3f(90.0, 0.0, -45.0))
+        cam_xform.AddRotateXYZOp().Set(Gf.Vec3f(90.0, 0.0, -90.0))
         
     def _is_orthogonal_to_normal(self, ray_dir, normal, threshold=0.1):
-        d = np.asarray(ray_dir, dtype=np.float32)
-        n = np.asarray(normal, dtype=np.float32)
+        d = np.asarray(ray_dir, dtype=np.float64)
+        n = np.asarray(normal, dtype=np.float64)
 
         d_norm = np.linalg.norm(d)
         n_norm = np.linalg.norm(n)
@@ -660,12 +1065,33 @@ class Adar:
 
         return abs(dot) < threshold
 
+
+    def is_target(self, prim_path: str) -> bool:
+        TARGET_PRIM_PATHS = (
+            "/World/PourInPlaceSafetyBollard_A02_01",            # safety bollard
+            "/World/Cylinder_01",            # safety bollard
+            "/World/WetFloorSign_B02_PR_NVD_01",
+        )
+        if not prim_path:
+            return False
+        return any(prim_path == t or prim_path.startswith(t + "/") for t in TARGET_PRIM_PATHS)
+
+    def hit_prim(self, hit) -> str:
+        return str(hit.get("collision", "") or hit.get("rigidBody", "") or "")
+
     def _scan_all(self):
+        #self._update_from_prim()
         hits = []
         normals = []
         for dir in self._dirs:
+            d = np.asarray(dir, dtype=np.float32)
+            n = np.linalg.norm(d)
+            if n < 1e-6 or not np.isfinite(n):
+                continue
             hit = self._scene_query.raycast_closest(self.origin, dir, self.max_range)
-            if hit['hit']:
+            prim = self.hit_prim(hit)
+
+            if hit['hit'] and self.is_target(prim):
                 p = hit["position"]
                 n = hit["normal"]
                 hits.append((float(p[0]), float(p[1]), float(p[2])))
@@ -674,6 +1100,7 @@ class Adar:
         return hits, normals
 
     def _scan(self):
+        #self._update_from_prim()
         hits = []
         hits_normals = []
         for dir in self._dirs:
@@ -700,13 +1127,13 @@ class Adar:
             i. The vector from POI to each probe point is orthogonal to the probe normal, and
             ii. The probe normals are not parallel to each other
         """
-        poi = np.asarray(point_of_interest, dtype=np.float32)
+        poi = np.asarray(point_of_interest, dtype=np.float64)
         for idx1, idx2 in _OPPOSING_PAIRS:
             point_1 = probe_points[idx1]
             point_2 = probe_points[idx2]
 
-            pos_1 = np.asarray(point_1, dtype=np.float32)
-            pos_2 = np.asarray(point_2, dtype=np.float32)
+            pos_1 = np.asarray(point_1, dtype=np.float64)
+            pos_2 = np.asarray(point_2, dtype=np.float64)
 
             # Check if the vector from POI to each probe point is orthogonal to the probe normal
             vec_to_1 = pos_1 - poi
@@ -729,8 +1156,8 @@ class Adar:
         return False
 
     def _is_parallel_to_normal(self, n1, n2, threshold=0.1):
-        n1 = np.asarray(n1, dtype=np.float32)
-        n2 = np.asarray(n2, dtype=np.float32)
+        n1 = np.asarray(n1, dtype=np.float64)
+        n2 = np.asarray(n2, dtype=np.float64)
 
         n1 /= np.linalg.norm(n1)
         n2 /= np.linalg.norm(n2)
@@ -744,8 +1171,8 @@ class Adar:
         The offset plane is perpendicular to the ray direction at the point of interest, so all probe rays are parallel 
         to the point of intrest ray.
         """
-        origin = np.asarray(self.origin, dtype=np.float32)
-        poi = np.asarray(point_of_interest, dtype=np.float32)
+        origin = np.asarray(self.origin, dtype=np.float64)
+        poi = np.asarray(point_of_interest, dtype=np.float64)
 
         ray_dir = poi - origin
         ray_len = np.linalg.norm(ray_dir)
@@ -753,11 +1180,10 @@ class Adar:
 
         axis1, axis2 = self._axes_from_direction(ray_dir)
 
-        n = 3
         probe_rays = []
         probe_spacing = self.wave_length / 2
-        for i in range(-n, n + 1):
-            for j in range(-n, n + 1):
+        for i in range(-2, 3):
+            for j in range(-2, 3):
                 if i == 0 and j == 0:
                     continue
 
@@ -837,15 +1263,22 @@ class Adar:
         if len(points) == 0:
             return
         
-        # draw all hits as red points
-        pts = [carb.Float3(x, y, z) for (x, y, z), _ in points]
-        colors = [carb.ColorRgba(1.0, 0.0, 0.0, 1.0) for _, _ in points]
-        sizes  = [intensity * 10 for _, intensity in points]
-
-        points.extend(pts)
-        colors.extend(colors)
-        sizes.extend(sizes)   
-
+        pts = []
+        colors = []
+        sizes = []
+        for item in points:
+            if len(item) == 2:  # old format (pos, intensity)
+                pos, intensity = item
+                color = carb.ColorRgba(1.0, 0.0, 0.0, 1.0)
+                size = intensity * 20
+            elif len(item) == 3:  # new format (pos, color, size)
+                pos, color, size = item
+            else:
+                continue
+            pts.append(carb.Float3(*pos))
+            colors.append(color)
+            sizes.append(size)
+        
         self._debug_draw.draw_points(pts, colors, sizes)
     
     def _draw_lines(self, starts, ends, colors: carb.ColorRgba, size=2.0):
@@ -866,29 +1299,137 @@ def create_phsics_scene(stage):
         scene.CreateGravityDirectionAttr().Set(Gf.Vec3f(0.0, 0.0, -1.0))
         scene.CreateGravityMagnitudeAttr().Set(981.0)
 
-def build_test_scene(stage):
-    # Ground plane
-    ground_path = "/World/Ground"
-    ground_prim = stage.GetPrimAtPath(ground_path)
-    if not ground_prim.IsValid():
-        ground_xform = UsdGeom.Xform.Define(stage, Sdf.Path(ground_path))
-        ground_cube = UsdGeom.Cube.Define(stage, ground_xform.GetPath().AppendChild("Cube"))
-        ground_cube.CreateSizeAttr().Set(1.0)
-        ground_cube.AddScaleOp().Set(Gf.Vec3d(20.0, 20.0, 0.01))
-        # Ensure the ground can be hit by raycasts
-        UsdPhysics.CollisionAPI.Apply(ground_cube.GetPrim())
+# AI generated test scene
+def _build_half_cylinder_mesh(radius: float, height: float, segments: int = 6400):
+    """
+    Builds mesh arrays for an open half-cylinder (concave interior faces the -X direction).
+    The arc spans 0 -> pi so the open mouth faces -X and the sensor at the origin
+    can see inside the curved inner surface.
+    Normals point inward so raycasts on the inner surface get a correct back-face normal.
+    """
+    bottom = []
+    top    = []
+    for i in range(segments + 1):
+        theta = -np.pi / 2  + np.pi * i / segments
+        x = radius * np.cos(theta)
+        y = radius * np.sin(theta)
+        bottom.append(Gf.Vec3f(x, y, -height / 2))
+        top.append(Gf.Vec3f(x, y,  height / 2))
+ 
+    points = bottom + top
+    S = segments + 1
+ 
+    face_vertex_counts  = []
+    face_vertex_indices = []
+    normals_list        = []
+    normal_indices_list = []
+    normal_idx          = 0
+ 
+    # Curved wall quads with inward-facing normals
+    for i in range(segments):
+        b0, b1 = i,     i + 1
+        t0, t1 = S + i, S + i + 1
+        face_vertex_counts.append(4)
+        face_vertex_indices.extend([b0, t0, t1, b1])
+        theta_mid = -np.pi / 2 + np.pi * (i + 0.5) / segments
+        nx = -np.cos(theta_mid)
+        ny = -np.sin(theta_mid)
+        normals_list.append(Gf.Vec3f(nx, ny, 0.0))
+        normal_indices_list.extend([normal_idx] * 4)
+        normal_idx += 1
+ 
+    return points, face_vertex_counts, face_vertex_indices, normals_list, normal_indices_list
 
-    # Cylinder
+def build_test_scene(stage):
+    build_cylinder(stage, 0.2, 2)
+    #build_half_cylinder(stage)
+
+def build_half_cylinder(stage, radius=3.0, height=4.0):
+    half_cyl_path = "/World/HalfCylinder"
+    half_cyl_prim = stage.GetPrimAtPath(half_cyl_path)
+    if not half_cyl_prim.IsValid():
+        points, face_vertex_counts, face_vertex_indices, normals_list, normal_indices_list = _build_half_cylinder_mesh(radius, height)
+        
+        mesh = UsdGeom.Mesh.Define(stage, Sdf.Path(half_cyl_path))
+        mesh.CreatePointsAttr(points)
+        mesh.CreateFaceVertexCountsAttr(face_vertex_counts)
+        mesh.CreateFaceVertexIndicesAttr(face_vertex_indices)
+
+        primvars_api = UsdGeom.PrimvarsAPI(mesh)
+        normals_pv = primvars_api.CreatePrimvar("normals", Sdf.ValueTypeNames.Normal3fArray, UsdGeom.Tokens.uniform)
+        normals_pv.Set(normals_list)
+        normals_pv.SetIndices(Vt.IntArray(normal_indices_list))
+
+        mesh.CreateDoubleSidedAttr().Set(True)
+        mesh.AddTranslateOp().Set(Gf.Vec3d(3.0, 0.0, 0.5))
+        UsdPhysics.CollisionAPI.Apply(mesh.GetPrim())
+
+def build_cylinder(stage, radius, x=2.0): 
     cylinder_path = "/World/Cylinder"
     cylinder_prim = stage.GetPrimAtPath(cylinder_path)
-    if not cylinder_prim.IsValid():
-        cylinder = UsdGeom.Cylinder.Define(stage, Sdf.Path(cylinder_path))
-        cylinder.CreateRadiusAttr().Set(0.2)
-        cylinder.CreateHeightAttr().Set(4.0)
-        # Place cylinder on the ground (centered in Z)
-        cylinder.AddTranslateOp().Set(Gf.Vec3d(3.0, 0.0, 0.5))
-        UsdPhysics.CollisionAPI.Apply(cylinder.GetPrim())
+    if cylinder_prim.IsValid():
+        stage.RemovePrim(cylinder_path)
+    cylinder = UsdGeom.Cylinder.Define(stage, Sdf.Path(cylinder_path))
+    cylinder.CreateRadiusAttr().Set(radius)
+    cylinder.CreateHeightAttr().Set(4.0)
+    cylinder.CreateAxisAttr().Set("Z")
 
+    UsdGeom.Xformable(cylinder.GetPrim()).ClearXformOpOrder()
+    cylinder.AddTranslateOp().Set(Gf.Vec3d(x + radius, 0.0, 0.5))
+    
+    prim = cylinder.GetPrim()
+    prim.CreateAttribute("refinementEnableOverride", Sdf.ValueTypeNames.Bool).Set(True)
+    prim.CreateAttribute("refinementLevel", Sdf.ValueTypeNames.Int).Set(3)
+    UsdPhysics.CollisionAPI.Apply(prim)
+
+def rebuild_half_cylinder(stage, radius, x=2.0):
+    half_cyl_path = "/World/HalfCylinder"
+    half_cyl_prim = stage.GetPrimAtPath(half_cyl_path)
+    if half_cyl_prim.IsValid():
+        stage.RemovePrim(half_cyl_path)
+
+    points, face_vertex_counts, face_vertex_indices, normals_list, normal_indices_list = _build_half_cylinder_mesh(radius, height=4.0)
+
+    mesh = UsdGeom.Mesh.Define(stage, Sdf.Path(half_cyl_path))
+    mesh.CreatePointsAttr(points)
+    mesh.CreateFaceVertexCountsAttr(face_vertex_counts)
+    mesh.CreateFaceVertexIndicesAttr(face_vertex_indices)
+
+    primvars_api = UsdGeom.PrimvarsAPI(mesh)
+    normals_pv = primvars_api.CreatePrimvar("normals", Sdf.ValueTypeNames.Normal3fArray, UsdGeom.Tokens.uniform)
+    normals_pv.Set(normals_list)
+    normals_pv.SetIndices(Vt.IntArray(normal_indices_list))
+
+    mesh.CreateDoubleSidedAttr().Set(True)
+    mesh.AddTranslateOp().Set(Gf.Vec3d(x - radius, 0.0, 0.5))
+    UsdPhysics.CollisionAPI.Apply(mesh.GetPrim())
+
+def change_radius(stage, radius):
+    #build_cylinder(stage, radius, x=2.0)
+    
+    helf_cyl_prim = stage.GetPrimAtPath("/World/HalfCylinder")
+    if helf_cyl_prim.IsValid():
+        points, face_vertex_counts, face_vertex_indices, normals_list, normal_indices_list = _build_half_cylinder_mesh(radius, height=4.0)
+        mesh = UsdGeom.Mesh(helf_cyl_prim)
+        mesh.GetPointsAttr().Set(points)
+        mesh.GetFaceVertexCountsAttr().Set(face_vertex_counts)
+        mesh.GetFaceVertexIndicesAttr().Set(face_vertex_indices)
+        primvars_api = UsdGeom.PrimvarsAPI(mesh)
+        normals_pv = primvars_api.GetPrimvar("normals")
+        if not normals_pv.IsDefined():
+            normals_pv = primvars_api.CreatePrimvar("normals", Sdf.ValueTypeNames.Normal3fArray, UsdGeom.Tokens.uniform)
+        normals_pv.Set(normals_list)
+        normals_pv.SetIndices(Vt.IntArray(normal_indices_list))
+
+def change_position(stage, x, radius):
+    half_cyl_prim = stage.GetPrimAtPath("/World/HalfCylinder")
+    if half_cyl_prim.IsValid():
+        xfrom = UsdGeom.Xformable(half_cyl_prim)
+        ops = xfrom.GetOrderedXformOps()
+        if ops:
+            ops[0].Set(Gf.Vec3d(x - radius, 0.0, 0.5))
+        else:
+            xfrom.AddTranslateOp().Set(Gf.Vec3d(x - radius, 0.0, 0.5))
 
 def create_cylinder_mover(speed=0.5, amplitude=3.0, height=0.5):
     """
@@ -946,11 +1487,7 @@ def register_step_callback(adar: Adar, stage):
     Returns:
         The callback ID
     """
-    # Create the cylinder mover with its own internal state
-    #move_cylinder = create_cylinder_mover(speed=0.5, amplitude=3.0, height=0.5)
-
     def update(dt: float):
-        #move_cylinder(stage, dt)
         adar.run_step()
 
     step_cb_id = SimulationManager.register_callback(
@@ -966,13 +1503,44 @@ def log_to_file(hits, hit_normals, filename="adar_hits.csv"):
             f.write(f"{hit_pos[0]},{hit_pos[1]},{hit_pos[2]},{normal[0]},{normal[1]},{normal[2]}\n")
     print(f"Logged {len(hits)} hits to {filename}")
 
+def register_sweep_callback(adar: Adar, stage, radii, on_complete):
+    state = {
+        "index": 0,
+        "phase": "warmup",
+        "cb_id": None,
+    }
+
+    def update(dt: float):
+        i = state["index"]
+        if i >= len(radii):
+            SimulationManager.deregister_callback(state["cb_id"])
+            omni.timeline.get_timeline_interface().stop()
+            on_complete()
+            return
+        
+        radius = radii[i]
+        if state["phase"] == "warmup":
+            build_cylinder(stage, radius, x=2.0)
+            adar.step_strategy.logger.set_radius(radius)
+            state["phase"] = "scan"
+            return
+
+        adar.run_step()
+        if i % 50 == 0:
+            print(f"Sweep progress: {i}/{len(radii)} (radius={radius:.3f})")
+        state["index"] += 1
+        state["phase"] = "warmup"
+    
+    cb_id = SimulationManager.register_callback(
+        update,
+        IsaacEvents.POST_PHYSICS_STEP
+    )
+    state["cb_id"] = cb_id
+    return cb_id
 
 def main():
     print("main started - initializing ADAR sensor...")
     stage = omni.usd.get_context().get_stage()
-
-    create_phsics_scene(stage)
-    #build_test_scene(stage)
 
     world = World(physics_prim_path=PHYSICS_SCENE_PATH)
     world.initialize_physics()
@@ -981,12 +1549,24 @@ def main():
     adar = Adar()
     adar.set_step_strategy(STEP_STRATEGIES["clustering"])
     adar.set_scan_strategy(SCAN_STRATEGIES["uniform_sphere"])
-    register_step_callback(adar, stage)
+    #register_step_callback(adar, stage)
 
-    timeline = omni.timeline.get_timeline_interface()
-    if not timeline.is_playing():
-        timeline.play()
-    
-    print("Adar initialized and running.")
+    simulation_steps = 500;
+    radii = np.linspace(0.5, 1000, simulation_steps)
+    wave_radii = radii * adar.wave_length
+
+    def on_complete():
+        world.stop()
+        adar.step_strategy.logger.close()
+        print("ADAR frame complete.")
+
+    #build_test_scene(stage)
+    #register_sweep_callback(adar, stage, radii=wave_radii, on_complete=on_complete)
+
+    adar.run_step()
+    #register_step_callback(adar, stage)
+    print("ADAR frame complete.")
+
+    #omni.timeline.get_timeline_interface().play()
 
 main()
