@@ -227,8 +227,41 @@ class IntensityStepStrategy(AdarStepStrategy):
         self.logger.log_hit(cp, intensity, np.abs(W), np.sqrt(intensity))
 
 
+class ClusteringLogger:
+    def __init__(self):
+        self.filename = "57815.csv"
+        self._file = open(self.filename, "w")
+        self._file.write("x,y,z,score,cluster_id\n")
+
+    def log_hit(self, hit, score, cluster_id):
+        x, y, z = hit[0], hit[1], hit[2]
+        self._file.write(f"{x},{y},{z},{score},{cluster_id}\n")
+    
+    def close(self):
+        self._file.close()
+
 class ClusteringStepStrategy(AdarStepStrategy):
+    def __init__(self):
+        self.logger = ClusteringLogger()
+
     def execute(self, adar):
+
+        TARGET_PRIM_PATHS = (
+            "/World/c638e5d6_0697_11ef_b025_b04f13dd02fd",      # person
+            "/World/PourInPlaceSafetyBollard_A02_01",            # safety bollard
+            "/World/Cylinder",
+            "/World/Cylinder_01",
+            "/World/Cube",
+            "/World/WetFloorSign_B02_PR_NVD_01",
+        )
+
+        def is_target(prim_path: str) -> bool:
+            if not prim_path:
+                return False
+            return any(prim_path == t or prim_path.startswith(t + "/") for t in TARGET_PRIM_PATHS)
+
+        def hit_prim(hit) -> str:
+            return str(hit.get("collision", "") or hit.get("rigidBody", "") or "")
 
         def theta(position: np.ndarray, normal: np.ndarray):
             """
@@ -306,7 +339,7 @@ class ClusteringStepStrategy(AdarStepStrategy):
             distance = np.linalg.norm(intersection - sensor_origin)
             return float(distance)
         
-        def score_function(dist: float, sigma=0.1) -> float:
+        def score_function(dist: float, sigma=0.3) -> float:
             """
             Computes a score based on the distance of the reflected hit, where closer hits get higher scores.
             """
@@ -319,6 +352,40 @@ class ClusteringStepStrategy(AdarStepStrategy):
             clustering = DBSCAN(eps=eps, min_samples=min_samples).fit(hits)
             return clustering.labels_
         
+        # AI Gen
+        def is_path_clear(start: np.ndarray, end: np.ndarray, ray_bias=1e-2):
+            """
+            Returns True if the straight segment from `start` to `end` is not blocked
+            by any geometry, i.e. the reflected ray can actually travel back to the
+            sensor plane without passing through an object.
+ 
+            We cast a ray from `start` towards `end` and treat the path as occluded
+            only if something is hit *before* we reach `end`. A small bias offsets the
+            origin off the surface to avoid self-intersection, and a small `slack`
+            tolerates floating point error / hitting the target surface itself.
+            """
+            start = np.asarray(start, dtype=np.float32)
+            end = np.asarray(end, dtype=np.float32)
+ 
+            seg = end - start
+            dist = float(np.linalg.norm(seg))
+            if dist < 1e-6:
+                return True
+ 
+            seg_dir = seg / dist
+ 
+            # Offset slightly off the originating surface to avoid self hits.
+            biased_origin = start + seg_dir * ray_bias
+ 
+            occ_hit = adar._scene_query.raycast_closest(
+                carb.Float3(float(biased_origin[0]), float(biased_origin[1]), float(biased_origin[2])),
+                carb.Float3(float(seg_dir[0]), float(seg_dir[1]), float(seg_dir[2])),
+                dist,
+            )
+ 
+            if not adar.check_hit(occ_hit):
+                return True 
+            
         def is_valid_refelction(reflected_dir: np.ndarray) -> bool:
             """
             Checks if the reflected ray direction is valid (i.e. it points back towards the sensor plane).
@@ -396,13 +463,16 @@ class ClusteringStepStrategy(AdarStepStrategy):
                 ray_dir = reflection_direction(prev_ray_dir, current_normal)
 
                 # Offset the ray origin slightly away from the surface to avoid self-intersection
-                ray_bias = 1e-2
+                ray_bias = 1e-3
                 biased_ray_origin = current_hit + ray_dir * ray_bias
 
                 refelction_hit = adar._scene_query.raycast_closest(biased_ray_origin, ray_dir, (adar.max_range * 2 - distance_traveled) / 2)
+                bounce_prim = hit_prim(refelction_hit)
 
                 if not adar.check_hit(refelction_hit):
                     break
+                if not is_target(bounce_prim):
+                        break
 
                 hit_position = np.asarray(refelction_hit["position"], dtype=np.float32)
                 hit_normal = np.asarray(refelction_hit["normal"], dtype=np.float32)
@@ -423,11 +493,14 @@ class ClusteringStepStrategy(AdarStepStrategy):
 
                 outgoing_reflection_dir = reflection_direction(ray_dir, current_normal)
                 if score > min_score_threshold and is_valid_refelction(outgoing_reflection_dir):
-                    last_ray_dir = ray_dir
+                    plane_pt = sensor_plane_hit_point(outgoing_reflection_dir, current_hit)
+                    if not is_path_clear(current_hit, plane_pt):
+                        break
 
                     total_distances_traveled = distance_traveled + np.linalg.norm(hit_position - origin)
                     psuedo_direction = (hit_position - origin) / np.linalg.norm(hit_position - origin)
                     estimated_postion = origin + psuedo_direction * (total_distances_traveled / 2)
+
                     point_items.append(Point(position=estimated_postion, score=score))
                 
                     # Segment 1: sensor origin → first surface hit (yellow)
@@ -487,8 +560,9 @@ class ClusteringStepStrategy(AdarStepStrategy):
             print(f"point at {weighted_pos} with average score {np.mean(cluster_weights)}")
 
             center_color = carb.ColorRgba(1.0, 1.0, 1.0, 1.0) # white
-            center_size = float(np.mean(cluster_weights))  * 40
+            center_size = float(np.mean(cluster_weights))  * 10
             points.append((weighted_pos, center_color, center_size))
+            
 
         adar._draw_lines(
             lines_origin_to_first[0],
@@ -843,7 +917,7 @@ SCAN_STRATEGIES = {
 }
 
 class Adar:
-    def __init__(self, origin=(0.0, 0.0, 0.5), direction=(1.0, 0.0, 0.0), max_range=5.0, num_points=1, wave_length=0.02, step_strategy="intensity", scan_strategy="uniform_sphere"):
+    def __init__(self, origin=(-3.53, 1.5, 0.3), direction=(1, 0, 0.0), max_range=10.0, num_points=20_000_000, wave_length=0.02, step_strategy="intensity", scan_strategy="uniform_sphere"):
         self.scan_strategy = SCAN_STRATEGIES.get(scan_strategy, SCAN_STRATEGIES["uniform_sphere"])
         self.step_strategy = STEP_STRATEGIES.get(step_strategy, STEP_STRATEGIES["intensity"])
 
@@ -861,8 +935,8 @@ class Adar:
         self._dirs = self._local_dirs.copy()
 
         self._stage = omni.usd.get_context().get_stage()
-        self._sensor_path = "/World/iw_hub/AdarSensor"
-        self._robot_body_path = "/World/iw_hub/chassis"
+        self._sensor_path = "/World/AdarSensor"
+        self._robot_body_path = "/World/spot/body"
         self._camera_path = self._sensor_path + "/Camera"
 
         self._sensor_box()
@@ -991,13 +1065,33 @@ class Adar:
 
         return abs(dot) < threshold
 
+
+    def is_target(self, prim_path: str) -> bool:
+        TARGET_PRIM_PATHS = (
+            "/World/PourInPlaceSafetyBollard_A02_01",            # safety bollard
+            "/World/Cylinder_01",            # safety bollard
+            "/World/WetFloorSign_B02_PR_NVD_01",
+        )
+        if not prim_path:
+            return False
+        return any(prim_path == t or prim_path.startswith(t + "/") for t in TARGET_PRIM_PATHS)
+
+    def hit_prim(self, hit) -> str:
+        return str(hit.get("collision", "") or hit.get("rigidBody", "") or "")
+
     def _scan_all(self):
         #self._update_from_prim()
         hits = []
         normals = []
         for dir in self._dirs:
+            d = np.asarray(dir, dtype=np.float32)
+            n = np.linalg.norm(d)
+            if n < 1e-6 or not np.isfinite(n):
+                continue
             hit = self._scene_query.raycast_closest(self.origin, dir, self.max_range)
-            if hit['hit']:
+            prim = self.hit_prim(hit)
+
+            if hit['hit'] and self.is_target(prim):
                 p = hit["position"]
                 n = hit["normal"]
                 hits.append((float(p[0]), float(p[1]), float(p[2])))
@@ -1453,8 +1547,8 @@ def main():
     world.reset()
 
     adar = Adar()
-    adar.set_step_strategy(STEP_STRATEGIES["intensity"])
-    adar.set_scan_strategy(SCAN_STRATEGIES["cone_ray"])
+    adar.set_step_strategy(STEP_STRATEGIES["clustering"])
+    adar.set_scan_strategy(SCAN_STRATEGIES["uniform_sphere"])
     #register_step_callback(adar, stage)
 
     simulation_steps = 500;
@@ -1466,9 +1560,13 @@ def main():
         adar.step_strategy.logger.close()
         print("ADAR frame complete.")
 
-    build_test_scene(stage)
-    register_sweep_callback(adar, stage, radii=wave_radii, on_complete=on_complete)
+    #build_test_scene(stage)
+    #register_sweep_callback(adar, stage, radii=wave_radii, on_complete=on_complete)
 
-    omni.timeline.get_timeline_interface().play()
+    adar.run_step()
+    #register_step_callback(adar, stage)
+    print("ADAR frame complete.")
+
+    #omni.timeline.get_timeline_interface().play()
 
 main()
